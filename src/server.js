@@ -1,4 +1,4 @@
-import { httpServerHandler } from "cloudflare:node";
+
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -14,8 +14,6 @@ const PORT = Number(process.env.PORT) || 3000;
 
 app.disable("x-powered-by");
 
-// Render runs the app behind a reverse proxy.
-// Set TRUST_PROXY=false only when running directly without a trusted proxy.
 app.set(
   "trust proxy",
   process.env.TRUST_PROXY === "false" ? false : 1
@@ -23,7 +21,6 @@ app.set(
 
 app.use(helmet());
 
-// CORS configuration
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
   .map(origin => origin.trim().replace(/\/$/, ""))
@@ -31,14 +28,11 @@ const allowedOrigins = (process.env.CORS_ORIGIN || "")
 
 app.use(cors({
   origin(origin, callback) {
-    // Allow server-to-server requests with no Origin header.
-    if (!origin) {
-      return callback(null, true);
-    }
+    if (!origin) return callback(null, true);
 
-    const normalizedOrigin = origin.replace(/\/$/, "");
+    const normalized = origin.replace(/\/$/, "");
 
-    if (allowedOrigins.includes(normalizedOrigin)) {
+    if (allowedOrigins.includes(normalized)) {
       return callback(null, true);
     }
 
@@ -70,12 +64,10 @@ const GROQ_MODEL =
   process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
 // Rate limiter
-// This is an in-memory limiter for a single running instance.
 const requests = new Map();
-
 const RATE_LIMIT = 60;
-const WINDOW_MS = 60_000;
-const MAX_TRACKED_IPS = 20_000;
+const WINDOW_MS = 60000;
+const MAX_TRACKED_IPS = 20000;
 
 let rateLimitChecks = 0;
 
@@ -83,7 +75,6 @@ function rateLimit(req, res, next) {
   const now = Date.now();
   const ip = req.ip || req.socket.remoteAddress || "unknown";
 
-  // Periodically remove expired records to prevent unbounded growth.
   rateLimitChecks++;
 
   if (rateLimitChecks % 100 === 0) {
@@ -97,24 +88,16 @@ function rateLimit(req, res, next) {
   let record = requests.get(ip);
 
   if (!record || now - record.start >= WINDOW_MS) {
-    record = {
-      start: now,
-      count: 0
-    };
+    record = { start: now, count: 0 };
   }
 
   record.count++;
   requests.set(ip, record);
 
-  // Keep the map bounded if many different IPs appear.
   while (requests.size > MAX_TRACKED_IPS) {
-    const oldestKey = requests.keys().next().value;
-
-    if (oldestKey === undefined) {
-      break;
-    }
-
-    requests.delete(oldestKey);
+    const oldest = requests.keys().next().value;
+    if (oldest === undefined) break;
+    requests.delete(oldest);
   }
 
   if (record.count > RATE_LIMIT) {
@@ -126,7 +109,7 @@ function rateLimit(req, res, next) {
     });
   }
 
-  return next();
+  next();
 }
 
 // API authentication
@@ -164,10 +147,10 @@ function authenticate(req, res, next) {
     });
   }
 
-  return next();
+  next();
 }
 
-// Request validation errors are different from provider failures.
+// Validation
 class ValidationError extends Error {
   constructor(message) {
     super(message);
@@ -175,7 +158,6 @@ class ValidationError extends Error {
   }
 }
 
-// Validate and normalize messages
 function normalizeMessages(messages) {
   if (
     !Array.isArray(messages) ||
@@ -189,7 +171,7 @@ function normalizeMessages(messages) {
 
   let totalLength = 0;
 
-  const cleanMessages = messages.map(message => {
+  return messages.map(message => {
     if (
       !message ||
       !["system", "user", "assistant"].includes(message.role)
@@ -198,23 +180,19 @@ function normalizeMessages(messages) {
     }
 
     if (typeof message.content !== "string") {
-      throw new ValidationError(
-        "Message content must be text"
-      );
+      throw new ValidationError("Message content must be text");
     }
 
     const content = message.content.trim();
 
-    if (!content || content.length > 50_000) {
+    if (!content || content.length > 50000) {
       throw new ValidationError("Invalid message content");
     }
 
     totalLength += content.length;
 
-    if (totalLength > 100_000) {
-      throw new ValidationError(
-        "Total message size is too large"
-      );
+    if (totalLength > 100000) {
+      throw new ValidationError("Total message size is too large");
     }
 
     return {
@@ -222,27 +200,23 @@ function normalizeMessages(messages) {
       content
     };
   });
-
-  return cleanMessages;
 }
 
-// Gemini provider
+// Gemini
 async function askGemini(messages, modelName, temperature) {
   if (!gemini) {
     throw new Error("Gemini provider is not configured");
   }
 
   const systemMessages = messages
-    .filter(message => message.role === "system")
-    .map(message => message.content);
+    .filter(m => m.role === "system")
+    .map(m => m.content);
 
   const conversation = messages
-    .filter(message => message.role !== "system")
-    .map(message => {
-      const label =
-        message.role === "assistant" ? "Assistant" : "User";
-
-      return `${label}: ${message.content}`;
+    .filter(m => m.role !== "system")
+    .map(m => {
+      const label = m.role === "assistant" ? "Assistant" : "User";
+      return `${label}: ${m.content}`;
     })
     .join("\n\n");
 
@@ -254,11 +228,8 @@ async function askGemini(messages, modelName, temperature) {
 
   const model = gemini.getGenerativeModel({
     model: modelName,
-    systemInstruction:
-      systemMessages.join("\n\n") || undefined,
-    generationConfig: {
-      temperature
-    }
+    systemInstruction: systemMessages.join("\n\n") || undefined,
+    generationConfig: { temperature }
   });
 
   const result = await model.generateContent(conversation);
@@ -271,7 +242,7 @@ async function askGemini(messages, modelName, temperature) {
   return answer.trim();
 }
 
-// Groq provider
+// Groq
 async function askGroq(messages, modelName, temperature) {
   if (!groq) {
     throw new Error("Groq provider is not configured");
@@ -294,20 +265,20 @@ async function askGroq(messages, modelName, temperature) {
 
 // Main endpoint
 app.get("/", (req, res) => {
-  return res.json({
+  res.json({
     name: "OMNIVEX AI",
     description: "Independent Arabic-first AI provider",
-    version: "1.3.0",
+    version: "1.4.0",
     status: "running"
   });
 });
 
 // Health check
 app.get("/health", (req, res) => {
-  return res.json({
+  res.json({
     status: "healthy",
     service: "OMNIVEX AI Provider",
-    version: "1.3.0",
+    version: "1.4.0",
     providers: {
       gemini: Boolean(gemini),
       groq: Boolean(groq)
@@ -315,7 +286,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Models endpoint
+// Available models
 app.get("/v1/models", (req, res) => {
   const models = [];
 
@@ -335,7 +306,7 @@ app.get("/v1/models", (req, res) => {
     });
   }
 
-  return res.json({
+  res.json({
     object: "list",
     data: models
   });
@@ -380,20 +351,16 @@ app.post(
 
       const cleanMessages = normalizeMessages(messages);
 
-      let provider;
-      let modelName;
-
       const explicitModel =
         typeof model === "string" && model.length > 0;
 
-      // Explicit model selection
+      let provider;
+      let modelName;
+
       if (explicitModel && model.startsWith("gemini/")) {
         provider = "gemini";
         modelName = model.slice("gemini/".length);
-      } else if (
-        explicitModel &&
-        model.startsWith("groq/")
-      ) {
+      } else if (explicitModel && model.startsWith("groq/")) {
         provider = "groq";
         modelName = model.slice("groq/".length);
       } else if (model) {
@@ -418,7 +385,6 @@ app.post(
         });
       }
 
-      // Only configured models are allowed.
       if (
         (provider === "gemini" && modelName !== GEMINI_MODEL) ||
         (provider === "groq" && modelName !== GROQ_MODEL)
@@ -431,56 +397,23 @@ app.post(
         });
       }
 
-      if (provider === "gemini" && !gemini) {
-        return res.status(503).json({
-          error: {
-            message: "Gemini provider is unavailable",
-            type: "configuration_error"
-          }
-        });
-      }
-
-      if (provider === "groq" && !groq) {
-        return res.status(503).json({
-          error: {
-            message: "Groq provider is unavailable",
-            type: "configuration_error"
-          }
-        });
-      }
-
       let answer;
 
       try {
         answer = provider === "gemini"
-          ? await askGemini(
-              cleanMessages,
-              modelName,
-              temperature
-            )
-          : await askGroq(
-              cleanMessages,
-              modelName,
-              temperature
-            );
-      } catch (primaryError) {
-        console.error(
-          "Primary provider failed:",
-          primaryError.message
-        );
+          ? await askGemini(cleanMessages, modelName, temperature)
+          : await askGroq(cleanMessages, modelName, temperature);
 
-        // Do not silently switch providers when the caller
-        // explicitly selected a model.
+      } catch (primaryError) {
+        console.error("Primary provider failed:", primaryError.message);
+
         if (explicitModel) {
           throw primaryError;
         }
 
-        // Automatic fallback is available only when no model
-        // was explicitly requested.
         if (provider === "groq" && gemini) {
           provider = "gemini";
           modelName = GEMINI_MODEL;
-
           answer = await askGemini(
             cleanMessages,
             modelName,
@@ -489,7 +422,6 @@ app.post(
         } else if (provider === "gemini" && groq) {
           provider = "groq";
           modelName = GROQ_MODEL;
-
           answer = await askGroq(
             cleanMessages,
             modelName,
@@ -509,17 +441,16 @@ app.post(
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
         model: `${provider}/${modelName}`,
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: "assistant",
-              content: answer
-            },
-            finish_reason: "stop"
-          }
-        ]
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: answer
+          },
+          finish_reason: "stop"
+        }]
       });
+
     } catch (error) {
       if (error instanceof ValidationError) {
         return res.status(400).json({
@@ -530,10 +461,7 @@ app.post(
         });
       }
 
-      console.error(
-        "OMNIVEX request failed:",
-        error.message
-      );
+      console.error("OMNIVEX request failed:", error.message);
 
       return res.status(502).json({
         error: {
@@ -574,6 +502,10 @@ app.use((error, req, res, next) => {
     }
   });
 });
-// Start server
-const server = app.listen(PORT);
-export default httpServerHandler(server);
+
+// Start Node.js server
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`OMNIVEX AI running on port ${PORT}`);
+});
+
+export default server;
