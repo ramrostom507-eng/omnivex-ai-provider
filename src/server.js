@@ -1,3 +1,4 @@
+import { httpServerHandler } from "cloudflare:node";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -573,10 +574,5 @@ app.use((error, req, res, next) => {
     }
   });
 });
-
 // Start server
-app.listen(PORT, () => {
-  console.log(
-    `OMNIVEX AI Provider running on port ${PORT}`
-  );
-});
+export default httpServerHandler({ port: PORT });
