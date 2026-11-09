@@ -1,4 +1,3 @@
-
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -13,19 +12,35 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 app.disable("x-powered-by");
+
+// Render runs the app behind a reverse proxy.
+// Set TRUST_PROXY=false only when running directly without a trusted proxy.
+app.set(
+  "trust proxy",
+  process.env.TRUST_PROXY === "false" ? false : 1
+);
+
 app.use(helmet());
 
 // CORS configuration
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
-  .map(x => x.trim().replace(/\/$/, ""))
+  .map(origin => origin.trim().replace(/\/$/, ""))
   .filter(Boolean);
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin.replace(/\/$/, ""))) {
+    // Allow server-to-server requests with no Origin header.
+    if (!origin) {
       return callback(null, true);
     }
+
+    const normalizedOrigin = origin.replace(/\/$/, "");
+
+    if (allowedOrigins.includes(normalizedOrigin)) {
+      return callback(null, true);
+    }
+
     return callback(new Error("Origin not allowed"));
   },
   methods: ["GET", "POST", "OPTIONS"],
@@ -33,7 +48,10 @@ app.use(cors({
   maxAge: 86400
 }));
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({
+  limit: "1mb",
+  strict: true
+}));
 
 // AI providers
 const gemini = process.env.GEMINI_API_KEY
@@ -51,22 +69,52 @@ const GROQ_MODEL =
   process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
 // Rate limiter
+// This is an in-memory limiter for a single running instance.
 const requests = new Map();
+
 const RATE_LIMIT = 60;
-const WINDOW_MS = 60000;
+const WINDOW_MS = 60_000;
+const MAX_TRACKED_IPS = 20_000;
+
+let rateLimitChecks = 0;
 
 function rateLimit(req, res, next) {
   const now = Date.now();
   const ip = req.ip || req.socket.remoteAddress || "unknown";
 
+  // Periodically remove expired records to prevent unbounded growth.
+  rateLimitChecks++;
+
+  if (rateLimitChecks % 100 === 0) {
+    for (const [key, value] of requests) {
+      if (now - value.start >= WINDOW_MS) {
+        requests.delete(key);
+      }
+    }
+  }
+
   let record = requests.get(ip);
 
   if (!record || now - record.start >= WINDOW_MS) {
-    record = { start: now, count: 0 };
+    record = {
+      start: now,
+      count: 0
+    };
   }
 
   record.count++;
   requests.set(ip, record);
+
+  // Keep the map bounded if many different IPs appear.
+  while (requests.size > MAX_TRACKED_IPS) {
+    const oldestKey = requests.keys().next().value;
+
+    if (oldestKey === undefined) {
+      break;
+    }
+
+    requests.delete(oldestKey);
+  }
 
   if (record.count > RATE_LIMIT) {
     return res.status(429).json({
@@ -77,30 +125,24 @@ function rateLimit(req, res, next) {
     });
   }
 
-  if (requests.size > 10000) {
-    for (const [key, value] of requests) {
-      if (now - value.start >= WINDOW_MS) {
-        requests.delete(key);
-      }
-    }
-  }
-
-  next();
+  return next();
 }
 
 // API authentication
 function authenticate(req, res, next) {
-  const apiKey = process.env.OMNIVEX_API_KEY;
+  const apiKey = process.env.OMNIVEX_API_KEY || "";
 
-  if (!apiKey) {
+  if (!apiKey.trim()) {
     return res.status(503).json({
       error: {
-        message: "OMNIVEX API authentication is not configured"
+        message: "OMNIVEX API authentication is not configured",
+        type: "configuration_error"
       }
     });
   }
 
   const authorization = req.headers.authorization || "";
+
   const suppliedKey = authorization.startsWith("Bearer ")
     ? authorization.slice(7).trim()
     : "";
@@ -108,10 +150,11 @@ function authenticate(req, res, next) {
   const expected = Buffer.from(apiKey);
   const supplied = Buffer.from(suppliedKey);
 
-  if (
-    expected.length !== supplied.length ||
-    !timingSafeEqual(expected, supplied)
-  ) {
+  const valid =
+    expected.length === supplied.length &&
+    timingSafeEqual(expected, supplied);
+
+  if (!valid) {
     return res.status(401).json({
       error: {
         message: "Invalid API key",
@@ -120,7 +163,15 @@ function authenticate(req, res, next) {
     });
   }
 
-  next();
+  return next();
+}
+
+// Request validation errors are different from provider failures.
+class ValidationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ValidationError";
+  }
 }
 
 // Validate and normalize messages
@@ -130,7 +181,7 @@ function normalizeMessages(messages) {
     messages.length < 1 ||
     messages.length > 100
   ) {
-    throw new Error(
+    throw new ValidationError(
       "Messages must contain between 1 and 100 entries"
     );
   }
@@ -142,23 +193,27 @@ function normalizeMessages(messages) {
       !message ||
       !["system", "user", "assistant"].includes(message.role)
     ) {
-      throw new Error("Invalid message role");
+      throw new ValidationError("Invalid message role");
     }
 
     if (typeof message.content !== "string") {
-      throw new Error("Message content must be text");
+      throw new ValidationError(
+        "Message content must be text"
+      );
     }
 
     const content = message.content.trim();
 
-    if (!content || content.length > 50000) {
-      throw new Error("Invalid message content");
+    if (!content || content.length > 50_000) {
+      throw new ValidationError("Invalid message content");
     }
 
     totalLength += content.length;
 
-    if (totalLength > 100000) {
-      throw new Error("Total message size is too large");
+    if (totalLength > 100_000) {
+      throw new ValidationError(
+        "Total message size is too large"
+      );
     }
 
     return {
@@ -177,21 +232,23 @@ async function askGemini(messages, modelName, temperature) {
   }
 
   const systemMessages = messages
-    .filter(m => m.role === "system")
-    .map(m => m.content);
+    .filter(message => message.role === "system")
+    .map(message => message.content);
 
   const conversation = messages
-    .filter(m => m.role !== "system")
-    .map(m => {
+    .filter(message => message.role !== "system")
+    .map(message => {
       const label =
-        m.role === "assistant" ? "Assistant" : "User";
+        message.role === "assistant" ? "Assistant" : "User";
 
-      return `${label}: ${m.content}`;
+      return `${label}: ${message.content}`;
     })
     .join("\n\n");
 
   if (!conversation.trim()) {
-    throw new Error("No user conversation was provided");
+    throw new ValidationError(
+      "At least one user or assistant message is required"
+    );
   }
 
   const model = gemini.getGenerativeModel({
@@ -206,11 +263,11 @@ async function askGemini(messages, modelName, temperature) {
   const result = await model.generateContent(conversation);
   const answer = result.response.text();
 
-  if (!answer) {
+  if (typeof answer !== "string" || !answer.trim()) {
     throw new Error("Empty response from Gemini");
   }
 
-  return answer;
+  return answer.trim();
 }
 
 // Groq provider
@@ -231,25 +288,25 @@ async function askGroq(messages, modelName, temperature) {
     throw new Error("Empty response from Groq");
   }
 
-  return answer;
+  return answer.trim();
 }
 
 // Main endpoint
 app.get("/", (req, res) => {
-  res.json({
+  return res.json({
     name: "OMNIVEX AI",
     description: "Independent Arabic-first AI provider",
-    version: "1.2.0",
+    version: "1.3.0",
     status: "running"
   });
 });
 
 // Health check
 app.get("/health", (req, res) => {
-  res.json({
+  return res.json({
     status: "healthy",
     service: "OMNIVEX AI Provider",
-    version: "1.2.0",
+    version: "1.3.0",
     providers: {
       gemini: Boolean(gemini),
       groq: Boolean(groq)
@@ -277,7 +334,7 @@ app.get("/v1/models", (req, res) => {
     });
   }
 
-  res.json({
+  return res.json({
     object: "list",
     data: models
   });
@@ -300,7 +357,8 @@ app.post(
       if (stream === true) {
         return res.status(400).json({
           error: {
-            message: "Streaming is not supported yet"
+            message: "Streaming is not supported yet",
+            type: "invalid_request_error"
           }
         });
       }
@@ -313,7 +371,8 @@ app.post(
       ) {
         return res.status(400).json({
           error: {
-            message: "Temperature must be between 0 and 2"
+            message: "Temperature must be between 0 and 2",
+            type: "invalid_request_error"
           }
         });
       }
@@ -323,38 +382,50 @@ app.post(
       let provider;
       let modelName;
 
+      const explicitModel =
+        typeof model === "string" && model.length > 0;
+
       // Explicit model selection
-      if (typeof model === "string" && model.startsWith("gemini/")) {
+      if (explicitModel && model.startsWith("gemini/")) {
         provider = "gemini";
-        modelName = model.slice(7);
+        modelName = model.slice("gemini/".length);
       } else if (
-        typeof model === "string" &&
+        explicitModel &&
         model.startsWith("groq/")
       ) {
         provider = "groq";
-        modelName = model.slice(5);
+        modelName = model.slice("groq/".length);
       } else if (model) {
         return res.status(400).json({
           error: {
-            message: "Use gemini/ or groq/ model identifiers"
+            message: "Use gemini/ or groq/ model identifiers",
+            type: "invalid_request_error"
           }
         });
       } else if (groq) {
         provider = "groq";
         modelName = GROQ_MODEL;
-      } else {
+      } else if (gemini) {
         provider = "gemini";
         modelName = GEMINI_MODEL;
+      } else {
+        return res.status(503).json({
+          error: {
+            message: "No AI provider is configured",
+            type: "configuration_error"
+          }
+        });
       }
 
-      // Only configured models are allowed
+      // Only configured models are allowed.
       if (
         (provider === "gemini" && modelName !== GEMINI_MODEL) ||
         (provider === "groq" && modelName !== GROQ_MODEL)
       ) {
         return res.status(400).json({
           error: {
-            message: "Requested model is not configured"
+            message: "Requested model is not configured",
+            type: "invalid_request_error"
           }
         });
       }
@@ -362,7 +433,8 @@ app.post(
       if (provider === "gemini" && !gemini) {
         return res.status(503).json({
           error: {
-            message: "Gemini provider is unavailable"
+            message: "Gemini provider is unavailable",
+            type: "configuration_error"
           }
         });
       }
@@ -370,7 +442,8 @@ app.post(
       if (provider === "groq" && !groq) {
         return res.status(503).json({
           error: {
-            message: "Groq provider is unavailable"
+            message: "Groq provider is unavailable",
+            type: "configuration_error"
           }
         });
       }
@@ -389,18 +462,20 @@ app.post(
               modelName,
               temperature
             );
-
       } catch (primaryError) {
         console.error(
           "Primary provider failed:",
           primaryError.message
         );
 
-        // Automatic fallback only when no model was explicitly requested
-        if (model) {
+        // Do not silently switch providers when the caller
+        // explicitly selected a model.
+        if (explicitModel) {
           throw primaryError;
         }
 
+        // Automatic fallback is available only when no model
+        // was explicitly requested.
         if (provider === "groq" && gemini) {
           provider = "gemini";
           modelName = GEMINI_MODEL;
@@ -410,7 +485,6 @@ app.post(
             modelName,
             temperature
           );
-
         } else if (provider === "gemini" && groq) {
           provider = "groq";
           modelName = GROQ_MODEL;
@@ -420,13 +494,12 @@ app.post(
             modelName,
             temperature
           );
-
         } else {
           throw primaryError;
         }
       }
 
-      if (!answer || !answer.trim()) {
+      if (typeof answer !== "string" || !answer.trim()) {
         throw new Error("Empty AI response");
       }
 
@@ -446,8 +519,16 @@ app.post(
           }
         ]
       });
-
     } catch (error) {
+      if (error instanceof ValidationError) {
+        return res.status(400).json({
+          error: {
+            message: error.message,
+            type: "invalid_request_error"
+          }
+        });
+      }
+
       console.error(
         "OMNIVEX request failed:",
         error.message
@@ -471,14 +552,24 @@ app.use((error, req, res, next) => {
     return next(error);
   }
 
-  const status =
-    error.type === "entity.too.large" ? 413 : 400;
+  let status = 400;
+  let message = "Invalid request";
+
+  if (error.type === "entity.too.large") {
+    status = 413;
+    message = "Request body is too large";
+  } else if (error.message === "Origin not allowed") {
+    status = 403;
+    message = "Origin not allowed";
+  } else if (error.type === "entity.parse.failed") {
+    status = 400;
+    message = "Invalid JSON request body";
+  }
 
   return res.status(status).json({
     error: {
-      message: status === 413
-        ? "Request body is too large"
-        : "Invalid request or origin"
+      message,
+      type: "request_error"
     }
   });
 });
