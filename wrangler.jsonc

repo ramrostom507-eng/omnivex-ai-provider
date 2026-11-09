@@ -1,0 +1,9 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "omnivex-ai-provider",
+  "main": "src/server.js",
+  "compatibility_date": "2026-11-09",
+  "observability": {
+    "enabled": true
+  }
+}
