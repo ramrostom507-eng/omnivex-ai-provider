@@ -5,22 +5,31 @@ import helmet from "helmet";
 import dotenv from "dotenv";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.disable("x-powered-by");
+
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
-  .map((origin) => origin.trim())
+  .map(origin => origin.trim().replace(/\/$/, ""))
   .filter(Boolean);
 
 app.use(helmet());
+
 app.use(cors({
-  origin: allowedOrigins.length ? allowedOrigins : true
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin.replace(/\/$/, ""))) {
+      return callback(null, true);
+    }
+    return callback(new Error("Origin not allowed"));
+  }
 }));
+
 app.use(express.json({ limit: "1mb" }));
 
 const gemini = process.env.GEMINI_API_KEY
@@ -40,14 +49,24 @@ const GROQ_MODEL =
 function authenticate(req, res, next) {
   const apiKey = process.env.OMNIVEX_API_KEY;
 
-  if (!apiKey) return next();
+  if (!apiKey) {
+    return res.status(503).json({
+      error: { message: "API authentication is not configured" }
+    });
+  }
 
   const authorization = req.headers.authorization || "";
   const suppliedKey = authorization.startsWith("Bearer ")
     ? authorization.slice(7)
     : "";
 
-  if (suppliedKey !== apiKey) {
+  const expected = Buffer.from(apiKey);
+  const supplied = Buffer.from(suppliedKey);
+
+  if (
+    supplied.length !== expected.length ||
+    !timingSafeEqual(supplied, expected)
+  ) {
     return res.status(401).json({
       error: {
         message: "Invalid API key",
@@ -60,16 +79,31 @@ function authenticate(req, res, next) {
 }
 
 function normalizeMessages(messages) {
-  return messages
-    .filter((message) =>
-      ["system", "user", "assistant"].includes(message.role)
-    )
-    .map((message) => ({
+  if (!Array.isArray(messages) || messages.length === 0 || messages.length > 100) {
+    throw new Error("Messages must contain between 1 and 100 entries");
+  }
+
+  return messages.map(message => {
+    if (
+      !message ||
+      !["system", "user", "assistant"].includes(message.role)
+    ) {
+      throw new Error("Invalid message role");
+    }
+
+    const content = typeof message.content === "string"
+      ? message.content
+      : JSON.stringify(message.content);
+
+    if (!content || content.length > 50000) {
+      throw new Error("Invalid or oversized message content");
+    }
+
+    return {
       role: message.role,
-      content: typeof message.content === "string"
-        ? message.content
-        : JSON.stringify(message.content)
-    }));
+      content
+    };
+  });
 }
 
 async function askGemini(messages, modelName, temperature) {
@@ -82,17 +116,15 @@ async function askGemini(messages, modelName, temperature) {
     generationConfig: { temperature }
   });
 
-  const prompt = messages
-    .map((message) => {
-      const label = {
-        system: "System",
-        user: "User",
-        assistant: "Assistant"
-      }[message.role];
+  const prompt = messages.map(message => {
+    const label = {
+      system: "System",
+      user: "User",
+      assistant: "Assistant"
+    }[message.role];
 
-      return `${label}: ${message.content}`;
-    })
-    .join("\n\n");
+    return `${label}: ${message.content}`;
+  }).join("\n\n");
 
   const result = await model.generateContent(prompt);
   return result.response.text();
@@ -150,21 +182,17 @@ app.get("/v1/models", (req, res) => {
     });
   }
 
-  res.json({
-    object: "list",
-    data: models
-  });
+  res.json({ object: "list", data: models });
 });
 
 app.post("/v1/chat/completions", authenticate, async (req, res) => {
   try {
-    const { messages, model, temperature = 0.7, stream = false } = req.body;
-
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({
-        error: { message: "A non-empty messages array is required" }
-      });
-    }
+    const {
+      messages,
+      model,
+      temperature = 0.7,
+      stream = false
+    } = req.body || {};
 
     if (stream) {
       return res.status(400).json({
@@ -172,24 +200,29 @@ app.post("/v1/chat/completions", authenticate, async (req, res) => {
       });
     }
 
-    const cleanMessages = normalizeMessages(messages);
-
-    if (!cleanMessages.length) {
+    if (
+      typeof temperature !== "number" ||
+      !Number.isFinite(temperature) ||
+      temperature < 0 ||
+      temperature > 2
+    ) {
       return res.status(400).json({
-        error: { message: "No valid messages were supplied" }
+        error: { message: "Temperature must be between 0 and 2" }
       });
     }
+
+    const cleanMessages = normalizeMessages(messages);
 
     let provider;
     let modelName;
 
-    if (model?.startsWith("gemini/")) {
+    if (typeof model === "string" && model.startsWith("gemini/")) {
       provider = "gemini";
-      modelName = model.slice("gemini/".length);
-    } else if (model?.startsWith("groq/")) {
+      modelName = model.slice(7);
+    } else if (typeof model === "string" && model.startsWith("groq/")) {
       provider = "groq";
-      modelName = model.slice("groq/".length);
-    } else if (model?.startsWith("gemini")) {
+      modelName = model.slice(5);
+    } else if (typeof model === "string" && model.startsWith("gemini")) {
       provider = "gemini";
       modelName = model;
     } else if (model) {
@@ -201,6 +234,24 @@ app.post("/v1/chat/completions", authenticate, async (req, res) => {
     } else {
       provider = "gemini";
       modelName = GEMINI_MODEL;
+    }
+
+    if (!modelName) {
+      return res.status(400).json({
+        error: { message: "Model name is required" }
+      });
+    }
+
+    if (provider === "gemini" && !gemini) {
+      return res.status(503).json({
+        error: { message: "Gemini provider is unavailable" }
+      });
+    }
+
+    if (provider === "groq" && !groq) {
+      return res.status(503).json({
+        error: { message: "Groq provider is unavailable" }
+      });
     }
 
     const answer = provider === "gemini"
@@ -225,13 +276,23 @@ app.post("/v1/chat/completions", authenticate, async (req, res) => {
   } catch (error) {
     console.error("OMNIVEX request failed:", error.message);
 
-    res.status(500).json({
+    res.status(502).json({
       error: {
         message: "The AI provider could not complete the request",
         type: "provider_error"
       }
     });
   }
+});
+
+app.use((error, req, res, next) => {
+  console.error("Request error:", error.message);
+
+  if (res.headersSent) return next(error);
+
+  res.status(400).json({
+    error: { message: "Invalid request or origin" }
+  });
 });
 
 app.listen(PORT, () => {
