@@ -575,4 +575,5 @@ app.use((error, req, res, next) => {
   });
 });
 // Start server
-export default httpServerHandler({ port: PORT });
+const server = app.listen(PORT);
+export default httpServerHandler(server);
