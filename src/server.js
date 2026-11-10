@@ -1,511 +1,442 @@
+/**
+ * OMNIVEX AI Provider — Cloudflare Workers
+ * OpenAI-compatible API gateway for Google Gemini and Groq.
+ *
+ * Existing src/server.js is intentionally preserved as the Node/Express fallback.
+ */
 
-import express from "express";
-import cors from "cors";
-import helmet from "helmet";
-import dotenv from "dotenv";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import Groq from "groq-sdk";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+const VERSION = "2.0.1";
+const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
+const DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile";
+const MAX_BODY_BYTES = 1_000_000;
+const MAX_MESSAGES = 100;
+const MAX_MESSAGE_CHARS = 100_000;
+const DEFAULT_TIMEOUT_MS = 45_000;
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX_REQUESTS = 60;
 
-dotenv.config();
+// Best-effort per-isolate limiter. For strict production limits, add Cloudflare
+// rate limiting rules or Durable Objects; this in-memory map is not global.
+const rateBuckets = new Map();
 
-const app = express();
-const PORT = Number(process.env.PORT) || 3000;
+function json(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      ...headers,
+    },
+  });
+}
 
-app.disable("x-powered-by");
+function apiError(message, status = 400, type = "invalid_request_error", code = null) {
+  return json({ error: { message, type, ...(code ? { code } : {}) } }, status);
+}
 
-app.set(
-  "trust proxy",
-  process.env.TRUST_PROXY === "false" ? false : 1
-);
+function allowedOrigins(env) {
+  const raw = env.CORS_ORIGIN || "*";
+  if (raw.trim() === "*") return ["*"];
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
 
-app.use(helmet());
+function corsHeaders(request, env) {
+  const origin = request.headers.get("Origin") || "";
+  const allowed = allowedOrigins(env);
+  const originAllowed = allowed.includes("*") || allowed.includes(origin);
+  const headers = {
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-headers": "Authorization, Content-Type, X-Request-ID",
+    "access-control-max-age": "86400",
+    "vary": "Origin",
+  };
+  if (originAllowed && origin) {
+    headers["access-control-allow-origin"] = allowed.includes("*") ? "*" : origin;
+  } else if (allowed.includes("*")) {
+    headers["access-control-allow-origin"] = "*";
+  }
+  return headers;
+}
 
-const allowedOrigins = (process.env.CORS_ORIGIN || "")
-  .split(",")
-  .map(origin => origin.trim().replace(/\/$/, ""))
-  .filter(Boolean);
+function withCors(response, request, env) {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(corsHeaders(request, env))) {
+    headers.set(key, value);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
 
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin) return callback(null, true);
+function checkOrigin(request, env) {
+  const origin = request.headers.get("Origin");
+  if (!origin) return true; // server-to-server clients commonly omit Origin
+  const allowed = allowedOrigins(env);
+  return allowed.includes("*") || allowed.includes(origin);
+}
 
-    const normalized = origin.replace(/\/$/, "");
+function constantTimeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
+}
 
-    if (allowedOrigins.includes(normalized)) {
-      return callback(null, true);
-    }
+function authorized(request, env) {
+  if (!env.OMNIVEX_API_KEY) return false;
+  const header = request.headers.get("Authorization") || "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return Boolean(match && constantTimeEqual(match[1].trim(), env.OMNIVEX_API_KEY));
+}
 
-    return callback(new Error("Origin not allowed"));
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  maxAge: 86400
-}));
+function clientKey(request) {
+  // Cloudflare supplies this header at the edge. It is used only for best-effort
+  // throttling and is not logged or returned.
+  return request.headers.get("CF-Connecting-IP") || "unknown";
+}
 
-app.use(express.json({
-  limit: "1mb",
-  strict: true
-}));
-
-// AI providers
-const gemini = process.env.GEMINI_API_KEY
-  ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
-  : null;
-
-const groq = process.env.GROQ_API_KEY
-  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
-  : null;
-
-const GEMINI_MODEL =
-  process.env.GEMINI_MODEL || "gemini-2.5-flash";
-
-const GROQ_MODEL =
-  process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
-
-// Rate limiter
-const requests = new Map();
-const RATE_LIMIT = 60;
-const WINDOW_MS = 60000;
-const MAX_TRACKED_IPS = 20000;
-
-let rateLimitChecks = 0;
-
-function rateLimit(req, res, next) {
+function checkRateLimit(request) {
   const now = Date.now();
-  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  const key = clientKey(request);
+  let bucket = rateBuckets.get(key);
+  if (!bucket || now - bucket.start >= RATE_WINDOW_MS) {
+    bucket = { start: now, count: 0 };
+  }
+  bucket.count += 1;
+  rateBuckets.set(key, bucket);
 
-  rateLimitChecks++;
-
-  if (rateLimitChecks % 100 === 0) {
-    for (const [key, value] of requests) {
-      if (now - value.start >= WINDOW_MS) {
-        requests.delete(key);
-      }
+  // Bound memory growth in long-lived isolates.
+  if (rateBuckets.size > 5_000) {
+    for (const [k, v] of rateBuckets) {
+      if (now - v.start >= RATE_WINDOW_MS) rateBuckets.delete(k);
     }
   }
-
-  let record = requests.get(ip);
-
-  if (!record || now - record.start >= WINDOW_MS) {
-    record = { start: now, count: 0 };
-  }
-
-  record.count++;
-  requests.set(ip, record);
-
-  while (requests.size > MAX_TRACKED_IPS) {
-    const oldest = requests.keys().next().value;
-    if (oldest === undefined) break;
-    requests.delete(oldest);
-  }
-
-  if (record.count > RATE_LIMIT) {
-    return res.status(429).json({
-      error: {
-        message: "Too many requests. Try again later.",
-        type: "rate_limit_error"
-      }
-    });
-  }
-
-  next();
+  return {
+    allowed: bucket.count <= RATE_MAX_REQUESTS,
+    remaining: Math.max(0, RATE_MAX_REQUESTS - bucket.count),
+    resetSeconds: Math.max(1, Math.ceil((bucket.start + RATE_WINDOW_MS - now) / 1000)),
+  };
 }
 
-// API authentication
-function authenticate(req, res, next) {
-  const apiKey = process.env.OMNIVEX_API_KEY || "";
-
-  if (!apiKey.trim()) {
-    return res.status(503).json({
-      error: {
-        message: "OMNIVEX API authentication is not configured",
-        type: "configuration_error"
-      }
-    });
+async function readJson(request) {
+  const declaredLength = Number(request.headers.get("content-length") || 0);
+  if (declaredLength > MAX_BODY_BYTES) {
+    throw Object.assign(new Error("حجم الطلب أكبر من الحد المسموح (1 ميغابايت)."), { status: 413 });
   }
-
-  const authorization = req.headers.authorization || "";
-
-  const suppliedKey = authorization.startsWith("Bearer ")
-    ? authorization.slice(7).trim()
-    : "";
-
-  const expected = Buffer.from(apiKey);
-  const supplied = Buffer.from(suppliedKey);
-
-  const valid =
-    expected.length === supplied.length &&
-    timingSafeEqual(expected, supplied);
-
-  if (!valid) {
-    return res.status(401).json({
-      error: {
-        message: "Invalid API key",
-        type: "authentication_error"
-      }
-    });
+  const text = await request.text();
+  if (new TextEncoder().encode(text).length > MAX_BODY_BYTES) {
+    throw Object.assign(new Error("حجم الطلب أكبر من الحد المسموح (1 ميغابايت)."), { status: 413 });
   }
-
-  next();
-}
-
-// Validation
-class ValidationError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "ValidationError";
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw Object.assign(new Error("Invalid JSON request body"), { status: 400 });
   }
 }
 
-function normalizeMessages(messages) {
-  if (
-    !Array.isArray(messages) ||
-    messages.length < 1 ||
-    messages.length > 100
-  ) {
-    throw new ValidationError(
-      "Messages must contain between 1 and 100 entries"
-    );
+function validateChatRequest(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw Object.assign(new Error("يجب إرسال جسم طلب JSON صالح."), { status: 400 });
+  }
+  if (body.stream === true) {
+    throw Object.assign(new Error("البث المباشر stream غير مدعوم حالياً؛ أرسل stream=false أو احذف الحقل."), { status: 400 });
+  }
+  if (!Array.isArray(body.messages) || body.messages.length === 0 || body.messages.length > MAX_MESSAGES) {
+    throw Object.assign(new Error(`يجب أن يحتوي messages على 1 إلى ${MAX_MESSAGES} رسالة.`), { status: 400 });
   }
 
-  let totalLength = 0;
-
-  return messages.map(message => {
-    if (
-      !message ||
-      !["system", "user", "assistant"].includes(message.role)
-    ) {
-      throw new ValidationError("Invalid message role");
+  const messages = body.messages.map((m, i) => {
+    if (!m || typeof m !== "object" || !["system", "user", "assistant"].includes(m.role)) {
+      throw Object.assign(new Error(`دور الرسالة رقم ${i + 1} غير صالح. الأدوار المدعومة: system, user, assistant.`), { status: 400 });
     }
-
-    if (typeof message.content !== "string") {
-      throw new ValidationError("Message content must be text");
-    }
-
-    const content = message.content.trim();
-
-    if (!content || content.length > 50000) {
-      throw new ValidationError("Invalid message content");
-    }
-
-    totalLength += content.length;
-
-    if (totalLength > 100000) {
-      throw new ValidationError("Total message size is too large");
-    }
-
-    return {
-      role: message.role,
-      content
-    };
-  });
-}
-
-// Gemini
-async function askGemini(messages, modelName, temperature) {
-  if (!gemini) {
-    throw new Error("Gemini provider is not configured");
-  }
-
-  const systemMessages = messages
-    .filter(m => m.role === "system")
-    .map(m => m.content);
-
-  const conversation = messages
-    .filter(m => m.role !== "system")
-    .map(m => {
-      const label = m.role === "assistant" ? "Assistant" : "User";
-      return `${label}: ${m.content}`;
-    })
-    .join("\n\n");
-
-  if (!conversation.trim()) {
-    throw new ValidationError(
-      "At least one user or assistant message is required"
-    );
-  }
-
-  const model = gemini.getGenerativeModel({
-    model: modelName,
-    systemInstruction: systemMessages.join("\n\n") || undefined,
-    generationConfig: { temperature }
-  });
-
-  const result = await model.generateContent(conversation);
-  const answer = result.response.text();
-
-  if (typeof answer !== "string" || !answer.trim()) {
-    throw new Error("Empty response from Gemini");
-  }
-
-  return answer.trim();
-}
-
-// Groq
-async function askGroq(messages, modelName, temperature) {
-  if (!groq) {
-    throw new Error("Groq provider is not configured");
-  }
-
-  const result = await groq.chat.completions.create({
-    model: modelName,
-    messages,
-    temperature
-  });
-
-  const answer = result.choices?.[0]?.message?.content;
-
-  if (typeof answer !== "string" || !answer.trim()) {
-    throw new Error("Empty response from Groq");
-  }
-
-  return answer.trim();
-}
-
-// Main endpoint
-app.get("/", (req, res) => {
-  res.json({
-    name: "OMNIVEX AI",
-    description: "Independent Arabic-first AI provider",
-    version: "1.4.0",
-    status: "running"
-  });
-});
-
-// Health check
-app.get("/health", (req, res) => {
-  res.json({
-    status: "healthy",
-    service: "OMNIVEX AI Provider",
-    version: "1.4.0",
-    providers: {
-      gemini: Boolean(gemini),
-      groq: Boolean(groq)
-    }
-  });
-});
-
-// Available models
-app.get("/v1/models", (req, res) => {
-  const models = [];
-
-  if (gemini) {
-    models.push({
-      id: `gemini/${GEMINI_MODEL}`,
-      object: "model",
-      provider: "gemini"
-    });
-  }
-
-  if (groq) {
-    models.push({
-      id: `groq/${GROQ_MODEL}`,
-      object: "model",
-      provider: "groq"
-    });
-  }
-
-  res.json({
-    object: "list",
-    data: models
-  });
-});
-
-// Chat completions
-app.post(
-  "/v1/chat/completions",
-  rateLimit,
-  authenticate,
-  async (req, res) => {
-    try {
-      const {
-        messages,
-        model,
-        temperature = 0.7,
-        stream = false
-      } = req.body || {};
-
-      if (stream === true) {
-        return res.status(400).json({
-          error: {
-            message: "Streaming is not supported yet",
-            type: "invalid_request_error"
-          }
-        });
-      }
-
-      if (
-        typeof temperature !== "number" ||
-        !Number.isFinite(temperature) ||
-        temperature < 0 ||
-        temperature > 2
-      ) {
-        return res.status(400).json({
-          error: {
-            message: "Temperature must be between 0 and 2",
-            type: "invalid_request_error"
-          }
-        });
-      }
-
-      const cleanMessages = normalizeMessages(messages);
-
-      const explicitModel =
-        typeof model === "string" && model.length > 0;
-
-      let provider;
-      let modelName;
-
-      if (explicitModel && model.startsWith("gemini/")) {
-        provider = "gemini";
-        modelName = model.slice("gemini/".length);
-      } else if (explicitModel && model.startsWith("groq/")) {
-        provider = "groq";
-        modelName = model.slice("groq/".length);
-      } else if (model) {
-        return res.status(400).json({
-          error: {
-            message: "Use gemini/ or groq/ model identifiers",
-            type: "invalid_request_error"
-          }
-        });
-      } else if (groq) {
-        provider = "groq";
-        modelName = GROQ_MODEL;
-      } else if (gemini) {
-        provider = "gemini";
-        modelName = GEMINI_MODEL;
+    let content = m.content;
+    if (typeof content !== "string") {
+      // Support the common OpenAI text-part array shape.
+      if (Array.isArray(content)) {
+        content = content
+          .filter((part) => part && part.type === "text" && typeof part.text === "string")
+          .map((part) => part.text)
+          .join("\n");
       } else {
-        return res.status(503).json({
-          error: {
-            message: "No AI provider is configured",
-            type: "configuration_error"
-          }
-        });
+        throw Object.assign(new Error(`محتوى الرسالة رقم ${i + 1} يجب أن يكون نصاً.`), { status: 400 });
       }
-
-      if (
-        (provider === "gemini" && modelName !== GEMINI_MODEL) ||
-        (provider === "groq" && modelName !== GROQ_MODEL)
-      ) {
-        return res.status(400).json({
-          error: {
-            message: "Requested model is not configured",
-            type: "invalid_request_error"
-          }
-        });
-      }
-
-      let answer;
-
-      try {
-        answer = provider === "gemini"
-          ? await askGemini(cleanMessages, modelName, temperature)
-          : await askGroq(cleanMessages, modelName, temperature);
-
-      } catch (primaryError) {
-        console.error("Primary provider failed:", primaryError.message);
-
-        if (explicitModel) {
-          throw primaryError;
-        }
-
-        if (provider === "groq" && gemini) {
-          provider = "gemini";
-          modelName = GEMINI_MODEL;
-          answer = await askGemini(
-            cleanMessages,
-            modelName,
-            temperature
-          );
-        } else if (provider === "gemini" && groq) {
-          provider = "groq";
-          modelName = GROQ_MODEL;
-          answer = await askGroq(
-            cleanMessages,
-            modelName,
-            temperature
-          );
-        } else {
-          throw primaryError;
-        }
-      }
-
-      if (typeof answer !== "string" || !answer.trim()) {
-        throw new Error("Empty AI response");
-      }
-
-      return res.json({
-        id: `omni-${randomUUID()}`,
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: `${provider}/${modelName}`,
-        choices: [{
-          index: 0,
-          message: {
-            role: "assistant",
-            content: answer
-          },
-          finish_reason: "stop"
-        }]
-      });
-
-    } catch (error) {
-      if (error instanceof ValidationError) {
-        return res.status(400).json({
-          error: {
-            message: error.message,
-            type: "invalid_request_error"
-          }
-        });
-      }
-
-      console.error("OMNIVEX request failed:", error.message);
-
-      return res.status(502).json({
-        error: {
-          message: "The AI provider could not complete the request",
-          type: "provider_error"
-        }
-      });
     }
-  }
-);
-
-// Central error handler
-app.use((error, req, res, next) => {
-  console.error("Request error:", error.message);
-
-  if (res.headersSent) {
-    return next(error);
-  }
-
-  let status = 400;
-  let message = "Invalid request";
-
-  if (error.type === "entity.too.large") {
-    status = 413;
-    message = "Request body is too large";
-  } else if (error.message === "Origin not allowed") {
-    status = 403;
-    message = "Origin not allowed";
-  } else if (error.type === "entity.parse.failed") {
-    status = 400;
-    message = "Invalid JSON request body";
-  }
-
-  return res.status(status).json({
-    error: {
-      message,
-      type: "request_error"
+    if (!content.trim()) {
+      throw Object.assign(new Error(`الرسالة رقم ${i + 1} فارغة.`), { status: 400 });
     }
+    if (content.length > MAX_MESSAGE_CHARS) {
+      throw Object.assign(new Error(`الرسالة رقم ${i + 1} تتجاوز الحد المسموح.`), { status: 400 });
+    }
+    return { role: m.role, content };
   });
-});
 
-// Start Node.js server
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`OMNIVEX AI running on port ${PORT}`);
-});
+  return {
+    messages,
+    requestedModel: typeof body.model === "string" ? body.model.trim() : "",
+    temperature: Number.isFinite(body.temperature) ? Math.min(2, Math.max(0, body.temperature)) : 0.7,
+    maxTokens: Number.isInteger(body.max_tokens) ? Math.min(8192, Math.max(1, body.max_tokens)) : 2048,
+  };
+}
 
-export default server;
+function toGeminiContents(messages) {
+  const systemText = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
+  const contents = messages
+    .filter((m) => m.role !== "system")
+    .map((m) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content }],
+    }));
+
+  // Gemini expects alternating user/model turns. Merge consecutive same-role
+  // messages to avoid provider-side invalid-turn errors.
+  const merged = [];
+  for (const item of contents) {
+    const previous = merged[merged.length - 1];
+    if (previous && previous.role === item.role) {
+      previous.parts[0].text += "\n\n" + item.parts[0].text;
+    } else {
+      merged.push(item);
+    }
+  }
+  if (merged.length && merged[0].role === "model") {
+    merged.unshift({ role: "user", parts: [{ text: "تابع المحادثة التالية." }] });
+  }
+  return { systemText, contents: merged };
+}
+
+function extractGeminiText(data) {
+  return (data?.candidates?.[0]?.content?.parts || [])
+    .map((part) => typeof part.text === "string" ? part.text : "")
+    .join("")
+    .trim();
+}
+
+async function fetchWithTimeout(url, options, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function callGemini(messages, env, model, temperature = 0.7, maxTokens = 2048) {
+  if (!env.GEMINI_API_KEY) throw new Error("مفتاح Gemini غير مضبوط على Cloudflare.");
+  const { systemText, contents } = toGeminiContents(messages);
+  if (!contents.length) throw new Error("أضف رسالة مستخدم واحدة على الأقل.");
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
+  const payload = {
+    contents,
+    generationConfig: { temperature, maxOutputTokens: maxTokens },
+  };
+  if (systemText) payload.systemInstruction = { parts: [{ text: systemText }] };
+
+  const response = await fetchWithTimeout(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = data?.error?.message || `Gemini API returned HTTP ${response.status}`;
+    throw Object.assign(new Error(message), { provider: "gemini", status: response.status });
+  }
+  const text = extractGeminiText(data);
+  if (!text) {
+    const reason = data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason || "empty_response";
+    throw Object.assign(new Error(`لم يُرجع Gemini نصاً صالحاً (${reason}).`), { provider: "gemini" });
+  }
+  return { text, model, provider: "gemini" };
+}
+
+async function callGroq(messages, env, model, temperature, maxTokens) {
+  if (!env.GROQ_API_KEY) throw new Error("مفتاح Groq غير مضبوط على Cloudflare.");
+  const response = await fetchWithTimeout("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${env.GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature,
+      max_tokens: maxTokens,
+      stream: false,
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = data?.error?.message || `Groq API returned HTTP ${response.status}`;
+    throw Object.assign(new Error(message), { provider: "groq", status: response.status });
+  }
+  const text = data?.choices?.[0]?.message?.content;
+  if (typeof text !== "string" || !text.trim()) {
+    throw Object.assign(new Error("Groq أعاد استجابة فارغة."), { provider: "groq" });
+  }
+  return { text: text.trim(), model: data.model || model, provider: "groq", usage: data.usage };
+}
+
+function modelChoice(requested, env) {
+  const geminiModel = env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+  const groqModel = env.GROQ_MODEL || DEFAULT_GROQ_MODEL;
+  if (!requested) return { provider: "auto", model: "" };
+
+  const lower = requested.toLowerCase();
+  if (lower.startsWith("gemini:")) {
+    return { provider: "gemini", model: requested.slice(7).trim() || geminiModel };
+  }
+  if (lower.startsWith("gemini/")) {
+    return { provider: "gemini", model: requested.slice(7).trim() || geminiModel };
+  }
+  if (lower.startsWith("google/")) {
+    return { provider: "gemini", model: requested.slice(7).trim() || geminiModel };
+  }
+  if (lower.startsWith("groq:")) {
+    return { provider: "groq", model: requested.slice(5).trim() || groqModel };
+  }
+  if (lower.startsWith("groq/")) {
+    return { provider: "groq", model: requested.slice(5).trim() || groqModel };
+  }
+  if (lower === "auto" || lower === "omnivex-auto") return { provider: "auto", model: "" };
+  // Recognize the configured default names even if they don't carry a prefix.
+  if (requested === geminiModel) return { provider: "gemini", model: requested };
+  if (requested === groqModel) return { provider: "groq", model: requested };
+  // OpenAI-compatible callers often send a provider model ID. Treat unknown IDs
+  // as Groq IDs; use "gemini:<model>" to select a specific Gemini model.
+  return { provider: "groq", model: requested };
+}
+
+function openAIResponse(result, requestId) {
+  return {
+    id: `chatcmpl-${crypto.randomUUID()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: result.model,
+    choices: [{
+      index: 0,
+      message: { role: "assistant", content: result.text },
+      finish_reason: "stop",
+    }],
+    ...(result.usage ? { usage: result.usage } : {}),
+    system_fingerprint: `omnivex-${VERSION}`,
+    ...(requestId ? { request_id: requestId } : {}),
+  };
+}
+
+async function handleChat(request, env) {
+  if (!authorized(request, env)) {
+    return apiError("مفتاح OMNIVEX API غير صحيح أو غير مضبوط.", 401, "authentication_error", "invalid_api_key");
+  }
+  const rate = checkRateLimit(request);
+  if (!rate.allowed) {
+    return json({ error: { message: "تم تجاوز عدد الطلبات المسموح مؤقتاً. حاول بعد دقيقة.", type: "rate_limit_error" } }, 429, {
+      "retry-after": String(rate.resetSeconds),
+      "x-ratelimit-remaining": "0",
+    });
+  }
+
+  let body;
+  try {
+    body = await readJson(request);
+    const input = validateChatRequest(body);
+    const choice = modelChoice(input.requestedModel, env);
+    let result;
+
+    if (choice.provider === "gemini") {
+      result = await callGemini(input.messages, env, choice.model || env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL, input.temperature, input.maxTokens);
+    } else if (choice.provider === "groq") {
+      result = await callGroq(input.messages, env, choice.model || env.GROQ_MODEL || DEFAULT_GROQ_MODEL, input.temperature, input.maxTokens);
+    } else {
+      // Automatic mode: prefer Groq, then Gemini. Only use a configured provider.
+      const attempts = [];
+      if (env.GROQ_API_KEY) {
+        try {
+          result = await callGroq(input.messages, env, env.GROQ_MODEL || DEFAULT_GROQ_MODEL, input.temperature, input.maxTokens);
+        } catch (error) { attempts.push(`Groq: ${error.message}`); }
+      }
+      if (!result && env.GEMINI_API_KEY) {
+        try {
+          result = await callGemini(input.messages, env, env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL, input.temperature, input.maxTokens);
+        } catch (error) { attempts.push(`Gemini: ${error.message}`); }
+      }
+      if (!result) {
+        throw new Error(attempts.join(" | ") || "لم يتم ضبط أي مزود ذكاء اصطناعي. أضف GEMINI_API_KEY أو GROQ_API_KEY.");
+      }
+    }
+
+    return json(openAIResponse(result, request.headers.get("X-Request-ID")), 200, {
+      "x-ratelimit-remaining": String(rate.remaining),
+    });
+  } catch (error) {
+    const status = error.status && Number.isInteger(error.status) ? error.status : 502;
+    const message = error.name === "AbortError" ? "انتهت مهلة الاتصال بمزود الذكاء الاصطناعي. حاول مجدداً." : (error.message || "حدث خطأ غير متوقع.");
+    return apiError(message, status, status >= 500 ? "provider_error" : "invalid_request_error");
+  }
+}
+
+async function route(request, env) {
+  const url = new URL(request.url);
+  const path = url.pathname.replace(/\/+$/, "") || "/";
+  const method = request.method.toUpperCase();
+
+  if (method === "OPTIONS") return new Response(null, { status: 204 });
+  if (!checkOrigin(request, env)) return apiError("هذا النطاق غير مسموح له باستخدام واجهة API.", 403, "cors_error");
+
+  if (method === "GET" && path === "/") {
+    return json({
+      name: "OMNIVEX AI Provider",
+      description: "Arabic-first OpenAI-compatible AI gateway",
+      version: VERSION,
+      status: "online",
+      endpoints: ["/health", "/v1/models", "/v1/chat/completions"],
+    });
+  }
+
+  if (method === "GET" && path === "/health") {
+    return json({
+      status: "ok",
+      service: "omnivex-ai-provider",
+      version: VERSION,
+      providers: {
+        gemini: Boolean(env.GEMINI_API_KEY),
+        groq: Boolean(env.GROQ_API_KEY),
+      },
+      authentication: Boolean(env.OMNIVEX_API_KEY),
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  if (method === "GET" && path === "/v1/models") {
+    if (!authorized(request, env)) return apiError("مفتاح OMNIVEX API غير صحيح أو غير مضبوط.", 401, "authentication_error", "invalid_api_key");
+    const models = [
+      { id: "omnivex-auto", object: "model", owned_by: "omnivex", description: "Automatic provider selection with fallback" },
+      { id: env.GROQ_MODEL || DEFAULT_GROQ_MODEL, object: "model", owned_by: "groq" },
+      { id: env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL, object: "model", owned_by: "google" },
+    ];
+    return json({ object: "list", data: models });
+  }
+
+  if (method === "POST" && path === "/v1/chat/completions") {
+    return handleChat(request, env);
+  }
+
+  if (path.startsWith("/v1/")) return apiError("المسار المطلوب غير موجود.", 404, "not_found_error");
+  return apiError("المسار غير موجود.", 404, "not_found_error");
+}
+
+export default {
+  async fetch(request, env) {
+    try {
+      const response = await route(request, env);
+      return withCors(response, request, env);
+    } catch (error) {
+      const response = apiError(error?.message || "Internal server error", 500, "server_error");
+      return withCors(response, request, env);
+    }
+  },
+};
