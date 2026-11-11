@@ -1,0 +1,6 @@
+name = "omnivex-ai-provider"
+main = "src/worker.js"
+compatibility_date = "2026-11-11"
+
+[observability]
+enabled = true
